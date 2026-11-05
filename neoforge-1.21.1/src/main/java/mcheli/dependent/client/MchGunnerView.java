@@ -70,7 +70,8 @@ public final class MchGunnerView {
     @SubscribeEvent
     public static void onComputeFov(ViewportEvent.ComputeFov event) {
         LocalPlayer player = Minecraft.getInstance().player;
-        if (zoom > 1.0F && gunnerVehicle(player) != null) {
+        // The TV-missile camera has no zoom (reference: camera.setCameraZoom(1.0F) while a TV missile flies).
+        if (zoom > 1.0F && gunnerVehicle(player) != null && MchTvView.activeMissile() == null) {
             event.setFOV(event.getFOV() / zoom); // optical zoom = narrower FOV
         }
     }

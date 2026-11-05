@@ -24,6 +24,12 @@ import net.neoforged.neoforge.client.extensions.common.RegisterClientExtensionsE
 public final class MchClientEvents {
     private MchClientEvents() {}
 
+    /** Wire the client-only TV-missile view check into the common projectile (it hides its trail while viewed). */
+    @SubscribeEvent
+    public static void onClientSetup(net.neoforged.fml.event.lifecycle.FMLClientSetupEvent event) {
+        mcheli.dependent.entity.MchBullet.TV_CAMERA_VIEW = MchTvView::isViewing;
+    }
+
     @SubscribeEvent
     public static void onRegisterRenderers(EntityRenderersEvent.RegisterRenderers event) {
         event.registerEntityRenderer(MchRegistries.VEHICLE.get(), MchGroundVehicleRenderer::new);
@@ -31,6 +37,7 @@ public final class MchClientEvents {
         event.registerEntityRenderer(MchRegistries.PLANE.get(), MchPlaneRenderer::new);
         event.registerEntityRenderer(MchRegistries.TANK.get(), MchTankRenderer::new);
         event.registerEntityRenderer(MchRegistries.DEMO_BULLET.get(), MchBulletRenderer::new);
+        event.registerEntityRenderer(MchRegistries.TV_MISSILE.get(), MchBulletRenderer::new);
         event.registerEntityRenderer(MchRegistries.CARTRIDGE.get(), MchCartridgeRenderer::new);
         event.registerEntityRenderer(MchRegistries.CONTAINER.get(), MchContainerRenderer::new);
         event.registerEntityRenderer(MchRegistries.FLARE.get(), MchFlareRenderer::new);

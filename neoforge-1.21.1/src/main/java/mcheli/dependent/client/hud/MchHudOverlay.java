@@ -27,11 +27,14 @@ import net.neoforged.neoforge.client.gui.VanillaGuiLayers;
 public final class MchHudOverlay {
     private MchHudOverlay() {}
 
+    private static final ResourceLocation TV_NOISE_LAYER = ResourceLocation.fromNamespaceAndPath(MCHeli.MODID, "tv_noise");
+    private static final ResourceLocation HUD_LAYER = ResourceLocation.fromNamespaceAndPath(MCHeli.MODID, "vehicle_hud");
+
     @SubscribeEvent
     public static void onRegisterGuiLayers(RegisterGuiLayersEvent event) {
-        event.registerAbove(VanillaGuiLayers.CROSSHAIR,
-            ResourceLocation.fromNamespaceAndPath(MCHeli.MODID, "vehicle_hud"),
-            MchHudOverlay::render);
+        // Bottom to top: the TV-missile camera noise, the cockpit HUD over it.
+        event.registerAbove(VanillaGuiLayers.CROSSHAIR, TV_NOISE_LAYER, MchTvNoiseOverlay::render);
+        event.registerAbove(TV_NOISE_LAYER, HUD_LAYER, MchHudOverlay::render);
     }
 
     /**
@@ -65,6 +68,12 @@ public final class MchHudOverlay {
         // gunner / mbt_gnr …), a pilot the pilot HUD; the per-seat names come from the vehicle's HUD = config list.
         int seat = Math.max(0, vehicle.seatIndexOf(mc.player));
         String hudName = vehicle.hudName(seat);
+        // Flying a TV missile through its camera: the config's TV-missile HUD replaces the seat HUD (reference
+        // drawHud -> info.hudTvMissile while isMissileCameraMode).
+        if (mcheli.dependent.client.MchTvView.activeMissile() != null && vehicle.hostInfo() != null
+                && vehicle.hostInfo().hudTvMissile != null) {
+            hudName = vehicle.hostInfo().hudTvMissile;
+        }
         if (hudName == null) {
             return;
         }

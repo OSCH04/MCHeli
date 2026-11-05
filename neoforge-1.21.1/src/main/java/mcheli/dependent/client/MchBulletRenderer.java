@@ -55,6 +55,9 @@ public class MchBulletRenderer extends EntityRenderer<MchBullet> {
     @Override
     public void render(MchBullet entity, float entityYaw, float partialTick, PoseStack pose, MultiBufferSource buffers,
                        int packedLight) {
+        if (MchTvView.isViewing(entity)) {
+            return; // reference isRenderBullet: the shooter looking through its TV camera does not see the missile
+        }
         String name = entity.bulletModelName();
         MchModel model = resolve(name);
 
