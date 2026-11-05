@@ -19,8 +19,8 @@ import org.slf4j.Logger;
 
 /**
  * Headless proof for the weapon features added on top of the port: the weapon fire-mode switch (incl. the m230's
- * non-explosive / [HE] rounds) and the round's block interaction (leaves shot through, HE without drops, glass panes
- * shattered).
+ * non-explosive / [HE] rounds), the smooth fire-and-forget AT guidance (direct + [TA] top attack) and the round's
+ * block interaction (leaves shot through, HE without drops, glass panes shattered).
  * Run with {@code ./gradlew :neoforge-1.21.1:runServer -PmcheliSelfTests} (property-gated, never in a normal launch).
  */
 public final class DemoControlsSelfTest {
@@ -37,6 +37,8 @@ public final class DemoControlsSelfTest {
         boolean pass = false;
         try {
             testWeaponModes(level);
+            testAtMissileFlight(level, MchBullet.GUIDED_AT_DIRECT);
+            testAtMissileFlight(level, MchBullet.GUIDED_AT_TOP);
             testBlockDamage(level);
             pass = true;
         } catch (Throwable t) {
@@ -144,6 +146,52 @@ public final class DemoControlsSelfTest {
             b.discard();
         }
         return power;
+    }
+
+    // ---- M: fire-and-forget AT missiles fly a smooth (turn-rate-limited) path onto their target ----
+    private void testAtMissileFlight(ServerLevel level, byte kind) {
+        MchHelicopter shooter = heli(level, "ah-64", 280.0);
+        net.minecraft.world.entity.decoration.ArmorStand target =
+            net.minecraft.world.entity.EntityType.ARMOR_STAND.create(level);
+        target.setNoGravity(true);
+        target.setPos(ox + 30.5, 240.0, oz + 20.5); // the 60x40 flight is centred on the spawn (loaded chunks)
+        target.setOldPosAndRot();
+        level.addFreshEntity(target);
+        mcheli.agnostic.weapon.MCH_WeaponInfo agm = mcheli.agnostic.weapon.MCH_WeaponInfoManager.get("agm114");
+        req(agm != null, "agm114 config");
+        MchBullet m = MchBullet.spawnGuided(level, new net.minecraft.world.phys.Vec3(ox - 29.5, 250.0, oz - 19.5),
+            new net.minecraft.world.phys.Vec3(0, 0, 1), 3.9F, 1.0F, 0.0F, agm.power, 600, shooter, "agm114",
+            0xFFFFFFFF, agm, target, kind);
+        req(m != null && m.isGuided(), "guided AT missile spawned");
+        net.minecraft.world.phys.Vec3 prev = null;
+        double maxTurn = 0.0, maxY = 250.0, minDist = Double.MAX_VALUE;
+        net.minecraft.world.phys.Vec3 aimC = target.position().add(0, 1, 0);
+        for (int i = 0; i < 200 && !m.isRemoved(); i++) {
+            net.minecraft.world.phys.Vec3 before = m.position();
+            m.tick();
+            net.minecraft.world.phys.Vec3 v = m.getDeltaMovement();
+            // closest approach along this tick's flight segment (one tick covers ~4 blocks)
+            net.minecraft.world.phys.Vec3 seg = m.isRemoved() ? v : m.position().subtract(before);
+            double sl = seg.lengthSqr();
+            double t = sl < 1.0e-9 ? 0.0 : Math.max(0.0, Math.min(1.0, aimC.subtract(before).dot(seg) / sl));
+            minDist = Math.min(minDist, before.add(seg.scale(t)).distanceTo(aimC));
+            if (prev != null && v.lengthSqr() > 1.0e-6 && prev.lengthSqr() > 1.0e-6) {
+                double a = Math.toDegrees(Math.acos(Math.max(-1.0, Math.min(1.0, v.normalize().dot(prev.normalize())))));
+                maxTurn = Math.max(maxTurn, a);
+            }
+            prev = v;
+            maxY = Math.max(maxY, m.getY());
+        }
+        req(m.isRemoved(), "the missile reached its target");
+        req(minDist < 4.0, "it hit the target (closest " + minDist + ")");
+        req(maxTurn <= 15.0, "no hard kinks: max turn " + maxTurn + "°/tick");
+        if (kind == MchBullet.GUIDED_AT_TOP) {
+            req(maxY > 262.0, "[TA] lofts above the launch altitude (apex " + maxY + ")");
+        }
+        LOG.info("[CONTROLS-SELFTEST] M AT missile kind {} OK (max turn {}°/tick, apex {}, closest {})",
+            kind, String.format("%.1f", maxTurn), String.format("%.1f", maxY), String.format("%.2f", minDist));
+        target.discard();
+        shooter.discard();
     }
 
     // ---- B: rounds fly through leaves, HE explodes (power 1, no drops) on solid blocks, panes shatter ----

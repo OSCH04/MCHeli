@@ -100,9 +100,12 @@ public class MchBullet extends Entity {
         net.minecraft.tags.TagKey.create(net.minecraft.core.registries.Registries.BLOCK,
             net.minecraft.resources.ResourceLocation.fromNamespaceAndPath(mcheli.MCHeli.MODID, "bullet_breakable"));
 
-    /** AT top-attack (weapon mode [TA], reference {@code MCH_EntityATMissile.guidanceType == 1}): climb to the
-     *  shooter's altitude +150, level over the target, then dive onto it with a +20% damage / +1 blast kicker. */
+    /** AT top-attack (weapon mode [TA], reference {@code MCH_EntityATMissile.guidanceType == 1}): climb to a loft
+     *  altitude over the target, level out, then dive onto it with a +20% damage / +1 blast kicker. */
     public static final byte GUIDED_AT_TOP = 3;
+    /** Fire-and-forget AT missiles (Hellfire & co.): max turn per tick in cruise, and in the last ~30 blocks. */
+    private static final double AT_MAX_TURN = Math.toRadians(8.0);
+    private static final double AT_TERMINAL_TURN = Math.toRadians(14.0);
 
     private float damage = 5.0F;
     private int life;
@@ -121,6 +124,8 @@ public class MchBullet extends Entity {
     private int markerCountdown;        // marker rocket: ticks from plant to the airstrike + despawn (reference countDown)
     private Entity targetEntity;        // guided missile: the locked target (server-side only; resolved live each tick)
     private float guideSpeed;           // guided missile: cruise speed for the guidance blend (reference this.acceleration)
+    private double topApexY = Double.NaN; // [TA] top attack: the loft altitude, fixed on the first guidance tick
+    private boolean topDiving;          // [TA] top attack: terminal dive started
     private double torpedoAccel;        // torpedo: the live water-run speed, ramped toward accelerationInWater (reference this.acceleration)
 
     public MchBullet(EntityType<? extends MchBullet> type, Level level) {
@@ -479,7 +484,7 @@ public class MchBullet extends Entity {
      * Server-side guided-missile steering (reference {@code MCH_EntityAAMissile}/{@code MCH_EntityATMissile}
      * {@code onUpdate}): dies if the target/shooter is gone or the target is beyond the per-type range; before
      * {@code rigidityTime} it flies straight (the launch boost); after, it proximity-detonates near the target or
-     * steers toward it (AA = pure-pursuit blend, AT = direct hard-snap). Sets the motion for the NEXT tick.
+     * steers toward it (AA = pure-pursuit blend, AT = turn-rate limited pursuit). Sets the motion for the NEXT tick.
      */
     private void tickGuidance() {
         byte g = this.entityData.get(DATA_GUIDED);
@@ -517,15 +522,14 @@ public class MchBullet extends Entity {
             if (this.age <= rigidity) {
                 return; // launch boost: fly straight before steering engages
             }
-            int startTick = this.weaponInfo != null ? this.weaponInfo.trajectoryParticleStartTick : 0;
-            float af = this.age < rigidity + startTick ? 0.5F : 1.0F;
-            applyGuidedMotion(MCH_MissileGuidance.hardSnap(this.getX(), this.getY(), this.getZ(),
-                this.targetEntity.getX(), this.targetEntity.getY(), this.targetEntity.getZ(), this.guideSpeed, af));
+            // A smooth pursuit instead of the reference's per-tick hard snap (which kinked the flight path into a sharp
+            // corner right after launch): fly at cruise speed toward the target's predicted position, turning at most
+            // AT_MAX_TURN per tick (more in the last ~30 blocks), so the missile curves onto its target.
+            Vec3 aim = interceptPoint(this.targetEntity);
+            steerTo(aim, aim.distanceTo(this.position()) < 30.0 ? AT_TERMINAL_TURN : AT_MAX_TURN);
         } else if (g == GUIDED_AT_TOP) {
             // Reference MCH_EntityATMissile.onUpdateMotion, guidanceType 1 (the [TA] weapon mode): the proximity fuse is
-            // live every tick like direct mode; after the boost the missile pursues three aim points in turn —
-            // 20 ticks toward a point 150 blocks above the SHOOTER's altitude over the target, 10 ticks back down to the
-            // shooter's altitude, then the target itself (with a one-shot +20% damage / +1 blast at boost+35).
+            // live every tick like direct mode.
             if (proximityHit) {
                 detonateOnTarget(g);
                 return;
@@ -533,25 +537,36 @@ public class MchBullet extends Entity {
             if (this.age <= rigidity) {
                 return;
             }
-            double tx = this.targetEntity.getX();
-            double tz = this.targetEntity.getZ();
-            double ty;
-            if (this.age <= rigidity + 20) {
-                ty = this.shooter.getY() + 150.0;
-            } else if (this.age <= rigidity + 30) {
-                ty = this.shooter.getY();
-            } else {
-                if (this.age == rigidity + 35) {
-                    this.damage = (int) (this.damage * 1.2F); // reference setPower((int)(power * 1.2F))
+            // A natural loft-and-dive instead of the reference's three hard aim points (150 blocks above the SHOOTER,
+            // back down, then the target): climb toward a loft altitude over the target that scales with the range,
+            // level out, then dive steeply onto it — every turn rate-limited, so it flies one smooth arc.
+            Vec3 tp = interceptPoint(this.targetEntity);
+            double hx = tp.x - this.getX();
+            double hz = tp.z - this.getZ();
+            double hd = Math.sqrt(hx * hx + hz * hz);
+            if (Double.isNaN(this.topApexY)) {
+                this.topApexY = Math.max(this.getY(), tp.y) + net.minecraft.util.Mth.clamp(hd * 0.3, 15.0, 60.0);
+            }
+            if (!this.topDiving) {
+                double turnRadius = this.guideSpeed / AT_MAX_TURN;
+                if (hd <= Math.max(0.0, this.getY() - tp.y) + turnRadius * 0.6) {
+                    this.topDiving = true;
+                    // reference terminal kicker: +20 % damage, +1 blast
+                    this.damage = (int) (this.damage * 1.2F);
                     if (this.explosionPower > 0) {
                         this.explosionPower++;
                     }
                 }
-                ty = this.targetEntity.getY();
             }
-            Vec3 m = this.getDeltaMovement();
-            applyGuidedMotion(MCH_MissileGuidance.guide(m.x, m.y, m.z, this.getX(), this.getY(), this.getZ(),
-                tx, ty, tz, this.guideSpeed));
+            Vec3 aim;
+            if (this.topDiving) {
+                aim = tp;
+            } else {
+                // climb toward the loft altitude over a point half way to the target, then cruise level at it
+                double f = hd > 1.0e-6 ? 0.5 : 0.0;
+                aim = new Vec3(this.getX() + hx * f, this.topApexY, this.getZ() + hz * f);
+            }
+            steerTo(aim, this.topDiving && aim.distanceTo(this.position()) < 30.0 ? AT_TERMINAL_TURN : AT_MAX_TURN);
         } else {
             if (this.age <= rigidity) {
                 return; // AA: proximity + steering both engage only after the boost (reference)
@@ -564,6 +579,48 @@ public class MchBullet extends Entity {
             applyGuidedMotion(MCH_MissileGuidance.guide(m.x, m.y, m.z, this.getX(), this.getY(), this.getZ(),
                 this.targetEntity.getX(), this.targetEntity.getY(), this.targetEntity.getZ(), this.guideSpeed));
         }
+    }
+
+    /** Turn the flight toward {@code aim} by at most {@code maxTurn} radians this tick, at cruise speed. */
+    private void steerTo(Vec3 aim, double maxTurn) {
+        Vec3 want = aim.subtract(this.position());
+        if (want.lengthSqr() < 1.0e-6) {
+            return;
+        }
+        Vec3 cur = this.getDeltaMovement();
+        Vec3 from = cur.lengthSqr() > 1.0e-9 ? cur.normalize() : want.normalize();
+        Vec3 nd = turnToward(from, want.normalize(), maxTurn);
+        Vec3 m = nd.scale(this.guideSpeed);
+        this.setDeltaMovement(m);
+        double h = Math.sqrt(m.x * m.x + m.z * m.z);
+        this.setYRot((float) Math.toDegrees(Math.atan2(-m.x, m.z)));
+        this.setXRot((float) Math.toDegrees(Math.atan2(-m.y, h)));
+    }
+
+    /** Where to aim at {@code t}: its centre, led by its own motion over the remaining flight time (capped). */
+    private Vec3 interceptPoint(Entity t) {
+        Vec3 c = t.position().add(0.0, t.getBbHeight() * 0.5, 0.0);
+        Vec3 v = new Vec3(t.getX() - t.xo, t.getY() - t.yo, t.getZ() - t.zo);
+        if (v.lengthSqr() > 9.0) {
+            v = Vec3.ZERO; // teleport / fresh spawn — not a real velocity
+        }
+        double speed = Math.max(0.5, this.guideSpeed);
+        double tof = Math.min(40.0, c.distanceTo(this.position()) / speed);
+        return c.add(v.scale(tof));
+    }
+
+    /** Rotate unit vector {@code a} toward unit vector {@code b} by at most {@code maxAngle} radians. */
+    private static Vec3 turnToward(Vec3 a, Vec3 b, double maxAngle) {
+        double ang = Math.acos(net.minecraft.util.Mth.clamp(a.dot(b), -1.0, 1.0));
+        if (ang <= maxAngle || ang < 1.0e-6) {
+            return b;
+        }
+        double s = Math.sin(ang);
+        if (s < 1.0e-6) {
+            return a; // exactly opposite: keep flying (the next tick's geometry breaks the tie)
+        }
+        double t = maxAngle / ang;
+        return a.scale(Math.sin((1.0 - t) * ang) / s).add(b.scale(Math.sin(t * ang) / s)).normalize();
     }
 
     /** Detonate a guided round on its target — reference explodes at the TARGET position ({@code mop.hitVec}), not the
