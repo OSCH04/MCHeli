@@ -69,6 +69,35 @@ public final class MchExplosion {
      */
     public static void explode(ServerLevel level, Vec3 center, int power, int sizeBlock, boolean flaming,
                                boolean destroyBlock, int fireCount, MCH_WeaponInfo damageInfo, Entity shooter) {
+        explode(level, center, power, sizeBlock, flaming, destroyBlock, fireCount, damageInfo, shooter, false);
+    }
+
+    /** Set while one of our no-drop explosions runs inside {@code level.explode} (server thread only). */
+    private static boolean noDropsActive;
+
+    /**
+     * Game-bus {@link net.neoforged.neoforge.event.level.ExplosionEvent.Detonate} hook: for a no-drop MCHeli blast
+     * (an HE gun round), remove the blown blocks ourselves WITHOUT loot — the same per-block
+     * {@code onBlockExploded} vanilla runs (so TNT still primes) — and hand vanilla an empty list. Under sustained
+     * chain-gun fire this keeps the ground free of item litter.
+     */
+    public static void onDetonate(net.neoforged.neoforge.event.level.ExplosionEvent.Detonate event) {
+        if (!noDropsActive || !(event.getLevel() instanceof ServerLevel level)) {
+            return;
+        }
+        for (net.minecraft.core.BlockPos pos : event.getAffectedBlocks()) {
+            net.minecraft.world.level.block.state.BlockState st = level.getBlockState(pos);
+            if (!st.isAir()) {
+                st.onBlockExploded(level, pos, event.getExplosion());
+            }
+        }
+        event.getAffectedBlocks().clear();
+    }
+
+    /** As above; {@code noDrops} = blown blocks vanish without dropping items (HE gun rounds). */
+    public static void explode(ServerLevel level, Vec3 center, int power, int sizeBlock, boolean flaming,
+                               boolean destroyBlock, int fireCount, MCH_WeaponInfo damageInfo, Entity shooter,
+                               boolean noDrops) {
         if (power <= 0 && sizeBlock <= 0) {
             return;
         }
@@ -116,9 +145,14 @@ public final class MchExplosion {
         // interaction, which respects the mobGriefing gamerule. Otherwise NONE breaks nothing but still puffs.
         boolean breakBlocks = destroyBlock && sizeBlock > 0;
         float visualRadius = breakBlocks ? sizeBlock : Math.max(1, power);
-        level.explode(shooter, level.damageSources().explosion(shooter, shooter), NO_VANILLA_ENTITY_DAMAGE,
-            center.x, center.y, center.z, visualRadius, flaming,
-            breakBlocks ? Level.ExplosionInteraction.MOB : Level.ExplosionInteraction.NONE);
+        noDropsActive = noDrops && breakBlocks;
+        try {
+            level.explode(shooter, level.damageSources().explosion(shooter, shooter), NO_VANILLA_ENTITY_DAMAGE,
+                center.x, center.y, center.z, visualRadius, flaming,
+                breakBlocks ? Level.ExplosionInteraction.MOB : Level.ExplosionInteraction.NONE);
+        } finally {
+            noDropsActive = false;
+        }
 
         spawnBlastEffect(level, center, Math.max(power, sizeBlock));
     }
