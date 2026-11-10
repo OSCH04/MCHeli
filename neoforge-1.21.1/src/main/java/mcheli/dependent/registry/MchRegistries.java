@@ -186,6 +186,12 @@ public final class MchRegistries {
         ENTITY_TYPES.register("demo_bullet", () ->
             EntityType.Builder.<MchBullet>of(MchBullet::new, MobCategory.MISC)
                 .sized(0.2F, 0.2F).clientTrackingRange(6).updateInterval(1).build("demo_bullet"));
+    /** A TV-guided missile: the same projectile, but tracked to clients much farther (16 chunks, capped by the server
+     *  view distance) — its shooter watches it through its nose camera, so it must not vanish after 96 blocks. */
+    public static final Supplier<EntityType<MchBullet>> TV_MISSILE =
+        ENTITY_TYPES.register("tv_missile", () ->
+            EntityType.Builder.<MchBullet>of(MchBullet::new, MobCategory.MISC)
+                .sized(0.2F, 0.2F).clientTrackingRange(16).updateInterval(1).build("tv_missile"));
 
     public static final Supplier<EntityType<MchCartridge>> CARTRIDGE =
         ENTITY_TYPES.register("cartridge", () ->

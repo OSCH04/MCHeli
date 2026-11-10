@@ -19,7 +19,8 @@ import org.slf4j.Logger;
 
 /**
  * Headless proof for the weapon features added on top of the port: the weapon fire-mode switch (incl. the m230's
- * non-explosive / [HE] rounds), the smooth fire-and-forget AT guidance (direct + [TA] top attack) and the round's
+ * non-explosive / [HE] rounds), the TV-guided missile (camera link + steering by the operator's look), the
+ * line-of-sight guided normal mode, the smooth fire-and-forget AT guidance (direct + [TA] top attack) and the round's
  * block interaction (leaves shot through, HE without drops, glass panes shattered).
  * Run with {@code ./gradlew :neoforge-1.21.1:runServer -PmcheliSelfTests} (property-gated, never in a normal launch).
  */
@@ -37,6 +38,8 @@ public final class DemoControlsSelfTest {
         boolean pass = false;
         try {
             testWeaponModes(level);
+            testTvMissile(level);
+            testLosMissile(level);
             testAtMissileFlight(level, MchBullet.GUIDED_AT_DIRECT);
             testAtMissileFlight(level, MchBullet.GUIDED_AT_TOP);
             testAtMissileCloseRange(level);
@@ -147,6 +150,139 @@ public final class DemoControlsSelfTest {
             b.discard();
         }
         return power;
+    }
+
+    // ---- T: TV-guided missile follows the operator's look ----
+    private void testTvMissile(ServerLevel level) {
+        MchHelicopter h = heli(level, "ah-64", 300.0);
+        h.tick();
+        FakePlayer pilot = fake(level, "mch_pilot5");
+        req(board(pilot, h), "pilot boards");
+        h.tick();
+        int idx = -1;
+        for (int i = 0; i < h.weaponCount() * 2 && idx < 0; i++) {
+            int sel = h.getSelectedWeaponIndex();
+            WeaponSlot s = sel >= 0 ? h.weaponAt(sel) : null;
+            if (s != null && s.weaponName.equalsIgnoreCase("agm114tv")) {
+                idx = sel;
+                break;
+            }
+            h.queueWeaponSwitch(pilot, 1);
+            h.tick();
+        }
+        req(idx >= 0, "the pilot can select the AGM-114 TV");
+        req(h.selectedWeaponName().endsWith(" [TV]"), "TV mode by default, HUD shows [TV]: " + h.selectedWeaponName());
+        h.toggleGunnerMode(pilot);
+        pilot.setYRot(90.0F);   // look west (-X)
+        pilot.setXRot(0.0F);
+        for (int i = 0; i < 40 && h.getTvMissileId() < 0; i++) {
+            h.controlState(0).fire = true;
+            h.tick();
+        }
+        h.controlState(0).fire = false;
+        req(h.getTvMissileId() >= 0, "firing in [TV] mode registers the active TV missile");
+        req(h.getTvMissileShooterId() == pilot.getId(), "the pilot is its operator");
+        req(h.tvMissileViewedBy(pilot) != null, "in gunner mode the pilot looks through the missile camera");
+        MchBullet tv = (MchBullet) level.getEntity(h.getTvMissileId());
+        req(tv != null && tv.isGuided(), "the TV missile is a guided round");
+        tv.tick();
+        net.minecraft.world.phys.Vec3 m1 = tv.getDeltaMovement().normalize();
+        req(m1.x < -0.95, "it flies where the pilot looks (west), motion " + m1);
+        pilot.setYRot(0.0F);    // now look south (+Z)
+        tv.tick();
+        net.minecraft.world.phys.Vec3 m2 = tv.getDeltaMovement().normalize();
+        req(m2.z > 0.95, "turning the head steers it (south), motion " + m2);
+        h.toggleGunnerMode(pilot);
+        req(h.tvMissileViewedBy(pilot) == null, "out of gunner mode the normal view returns (reference isCameraView)");
+        tv.discard();
+        h.tick();
+        req(h.getTvMissileId() < 0, "a gone TV missile is forgotten");
+        LOG.info("[CONTROLS-SELFTEST] T TV missile OK (west {} -> south {})", m1, m2);
+        pilot.stopRiding();
+        h.discard();
+
+        // The link drops when the operator leaves the vehicle (no camera left inside / jumping back in later).
+        MchHelicopter h2 = heli(level, "ah-64", 300.0);
+        h2.tick();
+        FakePlayer pilot2 = fake(level, "mch_pilot7");
+        req(board(pilot2, h2), "second pilot boards");
+        h2.tick();
+        for (int i = 0; i < h2.weaponCount() * 2; i++) {
+            int sel = h2.getSelectedWeaponIndex();
+            WeaponSlot s = sel >= 0 ? h2.weaponAt(sel) : null;
+            if (s != null && s.weaponName.equalsIgnoreCase("agm114tv")) {
+                break;
+            }
+            h2.queueWeaponSwitch(pilot2, 1);
+            h2.tick();
+        }
+        for (int i = 0; i < 40 && h2.getTvMissileId() < 0; i++) {
+            h2.controlState(0).fire = true;
+            h2.tick();
+        }
+        h2.controlState(0).fire = false;
+        req(h2.getTvMissileId() >= 0, "second TV missile linked");
+        MchBullet tv2 = (MchBullet) level.getEntity(h2.getTvMissileId());
+        pilot2.stopRiding();
+        h2.tick();
+        req(h2.getTvMissileId() < 0, "the TV link drops when the operator leaves the vehicle");
+        if (tv2 != null) {
+            tv2.discard();
+        }
+        h2.discard();
+        LOG.info("[CONTROLS-SELFTEST] T2 TV link drops on dismount OK");
+    }
+
+    // ---- S: a TV missile in its NORMAL mode is line-of-sight guided (flies onto the operator's sight line) ----
+    private void testLosMissile(ServerLevel level) {
+        MchHelicopter h = heli(level, "ah-64", 300.0);
+        h.tick();
+        FakePlayer pilot = fake(level, "mch_pilot6");
+        req(board(pilot, h), "pilot boards");
+        h.tick();
+        int idx = -1;
+        for (int i = 0; i < h.weaponCount() * 2 && idx < 0; i++) {
+            int sel = h.getSelectedWeaponIndex();
+            WeaponSlot s = sel >= 0 ? h.weaponAt(sel) : null;
+            if (s != null && s.weaponName.equalsIgnoreCase("agm114tv")) {
+                idx = sel;
+                break;
+            }
+            h.queueWeaponSwitch(pilot, 1);
+            h.tick();
+        }
+        req(idx >= 0, "the pilot can select the AGM-114 TV");
+        h.switchWeaponMode(pilot);
+        req(!h.selectedWeaponName().endsWith(" [TV]"), "normal mode selected: " + h.selectedWeaponName());
+        pilot.setYRot(90.0F);   // look west (-X)
+        pilot.setXRot(0.0F);
+        java.util.Set<Integer> before = new java.util.HashSet<>();
+        for (MchBullet b : level.getEntitiesOfClass(MchBullet.class, h.getBoundingBox().inflate(64.0))) {
+            before.add(b.getId());
+        }
+        MchBullet los = null;
+        for (int i = 0; i < 40 && los == null; i++) {
+            h.controlState(0).fire = true;
+            h.tick();
+            for (MchBullet b : level.getEntitiesOfClass(MchBullet.class, h.getBoundingBox().inflate(64.0))) {
+                if (!before.contains(b.getId()) && b.guidedKind() == MchBullet.GUIDED_LOS) {
+                    los = b;
+                }
+            }
+        }
+        h.controlState(0).fire = false;
+        req(los != null, "the normal-mode shot is a line-of-sight guided missile");
+        req(h.getTvMissileId() < 0, "no TV camera link in the normal mode");
+        pilot.setYRot(45.0F);   // swing the sight to south-west
+        for (int i = 0; i < 25 && !los.isRemoved(); i++) {
+            los.tick();
+        }
+        net.minecraft.world.phys.Vec3 m = los.getDeltaMovement().normalize();
+        req(m.z > 0.45 && m.x < -0.45, "it turned onto the new line of sight (south-west), motion " + m);
+        LOG.info("[CONTROLS-SELFTEST] S line-of-sight missile OK (west -> south-west {})", m);
+        los.discard();
+        pilot.stopRiding();
+        h.discard();
     }
 
     // ---- M: fire-and-forget AT missiles fly a smooth (turn-rate-limited) path onto their target ----

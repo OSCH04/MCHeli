@@ -50,6 +50,15 @@ public abstract class CameraMixin {
         if (cam == null || !(cam.getVehicle() instanceof AbstractMchVehicle v)) {
             return;
         }
+        // TV-guided missile camera (reference isMissileCameraMode -> MCH_ViewEntityDummy at the missile): the view rides
+        // in the missile's nose and looks where the player looks — the same look that steers the missile.
+        mcheli.dependent.entity.MchBullet tv = v.tvMissileViewedBy(cam);
+        if (tv != null) {
+            this.setPosition(new Vec3(Mth.lerp(partialTick, tv.xo, tv.getX()), Mth.lerp(partialTick, tv.yo, tv.getY()),
+                Mth.lerp(partialTick, tv.zo, tv.getZ())));
+            this.setRotation(cam.getViewYRot(partialTick), cam.getViewXRot(partialTick), 0.0F);
+            return;
+        }
         Vec3 eye = v.firstPersonEye(cam, partialTick); // null -> the vanilla player camera is the reference answer
         // The hull-locked camera is ONLY for the PILOT flying normally (mouse drives the airframe). A GUNNER — or the
         // pilot in gunner mode — free-looks to aim, so their camera must follow their own look, not weld to the hull

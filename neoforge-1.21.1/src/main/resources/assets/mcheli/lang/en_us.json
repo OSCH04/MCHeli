@@ -28,5 +28,6 @@
   "key.mcheli.zoom": "Gunner Zoom",
   "key.mcheli.free_look_toggle": "Free Look (toggle)",
   "key.mcheli.flare": "Dispense Flares",
-  "key.mcheli.weapon_mode": "Switch Weapon Mode"
+  "key.mcheli.weapon_mode": "Switch Weapon Mode",
+  "entity.mcheli.tv_missile": "TV Missile"
 }

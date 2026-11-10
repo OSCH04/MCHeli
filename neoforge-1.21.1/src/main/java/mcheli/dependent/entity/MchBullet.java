@@ -103,6 +103,15 @@ public class MchBullet extends Entity {
     /** AT top-attack (weapon mode [TA], reference {@code MCH_EntityATMissile.guidanceType == 1}): climb to a loft
      *  altitude over the target, level out, then dive onto it with a +20% damage / +1 blast kicker. */
     public static final byte GUIDED_AT_TOP = 3;
+    /** TV-guided (weapon mode [TV], reference {@code MCH_EntityTvMissile}): every tick it flies where its operator
+     *  LOOKS; the operator watches through the missile's nose camera while in gunner mode. */
+    public static final byte GUIDED_TV = 4;
+    /** Line-of-sight guided (SACLOS): a TV missile in its NORMAL (non-[TV]) mode — and a [TV] shot whose operator has
+     *  no camera view (e.g. a tank) — flies onto its operator's line of sight and along it, i.e. toward whatever his
+     *  crosshair rests on, without the nose camera. */
+    public static final byte GUIDED_LOS = 5;
+    /** Max turn of a line-of-sight guided missile per tick. */
+    private static final double LOS_MAX_TURN = Math.toRadians(8.0);
     /** Fire-and-forget AT missiles (Hellfire & co.): max turn per tick in cruise, and in the last ~30 blocks. */
     private static final double AT_MAX_TURN = Math.toRadians(8.0);
     private static final double AT_TERMINAL_TURN = Math.toRadians(14.0);
@@ -110,6 +119,10 @@ public class MchBullet extends Entity {
     private static final double AT_TURN_CAP = Math.toRadians(45.0);
     /** [TA]: height above the target the missile must have when the dive starts to count as a top attack (bonus). */
     private static final double TOP_MIN_LOFT = 10.0;
+
+    /** CLIENT hook: is this TV missile being flown through its camera by the local player right now? (Set by the
+     *  client setup; kept as a plain predicate so this common class never touches client-only classes.) */
+    public static java.util.function.Predicate<MchBullet> TV_CAMERA_VIEW = b -> false;
 
     private float damage = 5.0F;
     private int life;
@@ -127,6 +140,8 @@ public class MchBullet extends Entity {
     private boolean isBomblet;          // a sprinkled child (never re-splits)
     private int markerCountdown;        // marker rocket: ticks from plant to the airstrike + despawn (reference countDown)
     private Entity targetEntity;        // guided missile: the locked target (server-side only; resolved live each tick)
+    private Entity tvController;        // TV missile: the player whose look steers it (server-side only)
+    private long lastTickTime;          // game time of the last tick (spawn time until then)
     private float guideSpeed;           // guided missile: cruise speed for the guidance blend (reference this.acceleration)
     private double topApexY = Double.NaN; // [TA] top attack: the loft altitude, fixed on the first guidance tick
     private boolean topDiving;          // [TA] top attack: terminal dive started
@@ -136,6 +151,7 @@ public class MchBullet extends Entity {
         super(type, level);
         this.noPhysics = true;
         this.noCulling = true;
+        this.lastTickTime = level.getGameTime();
     }
 
     /** Spawn a projectile carrying a weapon's real stats + effects. {@code wi} may be null (a plain tracer). */
@@ -166,6 +182,49 @@ public class MchBullet extends Entity {
         }
         return b;
     }
+
+    /**
+     * Spawn a TV-GUIDED missile (reference {@code MCH_WeaponTvMissile} mode 0): launched like a plain missile, then
+     * steered every tick along {@code controller}'s look direction while it is its vehicle's active TV missile.
+     */
+    public static MchBullet spawnTv(Level level, Vec3 pos, Vec3 dir, float speed, float gravity, float damage,
+                                    int maxLife, Entity shooter, String modelName, int color, MCH_WeaponInfo wi,
+                                    Entity controller) {
+        Vec3 v = dir.lengthSqr() > 1.0e-9 ? dir.normalize().scale(speed) : new Vec3(0.0, 0.0, speed);
+        MchBullet b = createWithVelocity(mcheli.dependent.registry.MchRegistries.TV_MISSILE.get(), level, pos, v,
+            1.0F, gravity, damage, maxLife, shooter, modelName, color, wi, false, false);
+        b.tvController = controller;
+        b.guideSpeed = speed;
+        b.entityData.set(DATA_GUIDED, GUIDED_TV);
+        level.addFreshEntity(b);
+        return b;
+    }
+
+    /**
+     * Spawn a LINE-OF-SIGHT guided missile ({@link #GUIDED_LOS}): launched like a plain missile, then steered every tick
+     * onto {@code controller}'s line of sight while he still rides the launching vehicle (else it flies on straight).
+     */
+    public static MchBullet spawnLos(Level level, Vec3 pos, Vec3 dir, float speed, float gravity, float damage,
+                                     int maxLife, Entity shooter, String modelName, int color, MCH_WeaponInfo wi,
+                                     Entity controller) {
+        Vec3 v = dir.lengthSqr() > 1.0e-9 ? dir.normalize().scale(speed) : new Vec3(0.0, 0.0, speed);
+        MchBullet b = createWithVelocity(mcheli.dependent.registry.MchRegistries.DEMO_BULLET.get(), level, pos, v,
+            1.0F, gravity, damage, maxLife, shooter, modelName, color, wi, false, false);
+        b.tvController = controller;
+        b.guideSpeed = speed;
+        b.entityData.set(DATA_GUIDED, GUIDED_LOS);
+        level.addFreshEntity(b);
+        return b;
+    }
+
+    /** Has this round ticked within the last few game ticks? False once it sits outside the simulation distance,
+     *  where the server stops ticking entities (it would hang frozen in the air). */
+    public boolean tickedRecently(long now) {
+        return now - this.lastTickTime <= 5L;
+    }
+
+    /** The guidance kind ({@link #GUIDED_NONE}, {@link #GUIDED_TV}, {@link #GUIDED_LOS}, …), synced. */
+    public byte guidedKind() { return this.entityData.get(DATA_GUIDED); }
 
     /**
      * Spawn a DROPPED munition (bomb) — released at an EXPLICIT initial velocity (the aircraft's own motion, per the
@@ -205,7 +264,14 @@ public class MchBullet extends Entity {
     private static MchBullet createWithVelocity(Level level, Vec3 pos, Vec3 v, float accelerationFactor,
                                     float gravity, float damage, int maxLife, Entity shooter, String modelName,
                                     int color, MCH_WeaponInfo wi, boolean isBomblet) {
-        MchBullet b = new MchBullet(mcheli.dependent.registry.MchRegistries.DEMO_BULLET.get(), level);
+        return createWithVelocity(mcheli.dependent.registry.MchRegistries.DEMO_BULLET.get(), level, pos, v,
+            accelerationFactor, gravity, damage, maxLife, shooter, modelName, color, wi, isBomblet, true);
+    }
+
+    private static MchBullet createWithVelocity(EntityType<MchBullet> type, Level level, Vec3 pos, Vec3 v,
+                                    float accelerationFactor, float gravity, float damage, int maxLife, Entity shooter,
+                                    String modelName, int color, MCH_WeaponInfo wi, boolean isBomblet, boolean add) {
+        MchBullet b = new MchBullet(type, level);
         // Reference nudges the round half a step past the muzzle so it clears the barrel / registers point-blank.
         Vec3 start = pos.add(v.scale(0.5));
         b.setPos(start.x, start.y, start.z);
@@ -250,7 +316,9 @@ public class MchBullet extends Entity {
         double horiz = Math.sqrt(v.x * v.x + v.z * v.z);
         b.setYRot((float) Math.toDegrees(Math.atan2(-v.x, v.z)));
         b.setXRot((float) Math.toDegrees(Math.atan2(-v.y, horiz)));
-        level.addFreshEntity(b);
+        if (add) {
+            level.addFreshEntity(b);
+        }
         return b;
     }
 
@@ -301,6 +369,7 @@ public class MchBullet extends Entity {
     public void tick() {
         super.tick();
         this.age++;
+        this.lastTickTime = this.level().getGameTime();
 
         if (this.entityData.get(DATA_MARKER) == 2) { // planted marker: pulse the beacon / count down to the airstrike
             tickMarked();
@@ -492,6 +561,14 @@ public class MchBullet extends Entity {
      */
     private void tickGuidance() {
         byte g = this.entityData.get(DATA_GUIDED);
+        if (g == GUIDED_TV) {
+            tickTvGuidance();
+            return;
+        }
+        if (g == GUIDED_LOS) {
+            tickLosGuidance();
+            return;
+        }
         // Reference guidance guard needs a shooter REFERENCE + a live target — but does NOT require the shooter to be
         // ALIVE: a fired missile keeps homing after the launching aircraft is destroyed (fire-and-forget; the reference
         // AA/AT onUpdate only null-checks shootingEntity here). Shooter-death despawn for plain rounds lives in
@@ -594,6 +671,81 @@ public class MchBullet extends Entity {
             applyGuidedMotion(MCH_MissileGuidance.guide(m.x, m.y, m.z, this.getX(), this.getY(), this.getZ(),
                 this.targetEntity.getX(), this.targetEntity.getY(), this.targetEntity.getZ(), this.guideSpeed));
         }
+    }
+
+    /**
+     * Reference {@code MCH_EntityTvMissile.onUpdate/onUpdateMotion}: gone without its operator or beyond 1200 blocks
+     * from him; while it is its vehicle's ACTIVE TV missile (a newer one takes over) and the operator still sits in
+     * that vehicle, its motion is set every tick to the operator's look direction at cruise speed.
+     */
+    private void tickTvGuidance() {
+        Entity c = this.tvController;
+        if (c == null || this.shooter == null) {
+            this.discard();
+            return;
+        }
+        if (this.distanceToSqr(c) > 1440000.0) {
+            this.discard();
+            return;
+        }
+        // Video link range: the operator's client only receives this missile within its tracking range (capped by his
+        // view distance). At that edge the link drops cleanly — the camera returns to the gun sight and the missile flies
+        // on straight — instead of the missile silently vanishing from the client while still following the gunner's look.
+        // Only for an operator who actually watches through the camera: without it (e.g. a tank) the missile is line-of-
+        // sight guided, which runs on the server alone and needs no client view of the missile.
+        if (c instanceof net.minecraft.server.level.ServerPlayer sp && !(sp instanceof net.neoforged.neoforge.common.util.FakePlayer)
+                && this.shooter instanceof AbstractMchVehicle av && av.getTvMissileId() == this.getId()
+                && av.tvMissileViewedBy(c) == this) {
+            int vd = net.minecraft.util.Mth.clamp(sp.requestedViewDistance(), 2, sp.server.getPlayerList().getViewDistance());
+            double link = Math.min(sp.server.getScaledTrackingDistance(this.getType().clientTrackingRange() * 16), vd * 16)
+                - 16.0;
+            double dx = this.getX() - sp.getX();
+            double dz = this.getZ() - sp.getZ();
+            if (dx * dx + dz * dz > link * link) {
+                av.releaseTvMissile(this);
+            }
+        }
+        if (c.isAlive() && c.getVehicle() == this.shooter && this.shooter instanceof AbstractMchVehicle v
+                && v.getTvMissileId() == this.getId()) {
+            if (v.tvMissileViewedBy(c) != this) {
+                // No nose camera for this operator (a tank, a non-gunner seat, out of gunner mode): fly onto his line
+                // of sight instead of merely parallel to it, so it goes where his crosshair is.
+                steerAlongSight(v, c);
+                return;
+            }
+            Vec3 look = Vec3.directionFromRotation(c.getXRot(), c.getYRot());
+            Vec3 m = look.scale(this.guideSpeed);
+            this.setDeltaMovement(m);
+            this.setYRot(c.getYRot());
+            this.setXRot(c.getXRot());
+        }
+    }
+
+    /** {@link #GUIDED_LOS}: steer onto the operator's line of sight while he still rides the launcher; with the link
+     *  lost (operator gone / dismounted / beyond 1200 blocks) the missile flies on straight. */
+    private void tickLosGuidance() {
+        Entity c = this.tvController;
+        if (c != null && c.isAlive() && this.shooter instanceof AbstractMchVehicle v && c.getVehicle() == v
+                && this.distanceToSqr(c) <= 1440000.0) {
+            steerAlongSight(v, c);
+        }
+    }
+
+    /**
+     * Command to line of sight: aim at a point on the operator's sight ray (from his camera eye along his look) a
+     * little AHEAD of the missile's own projection onto it, turning at most {@link #LOS_MAX_TURN} per tick at cruise
+     * speed — the missile closes onto the line and then rides it to whatever the crosshair rests on.
+     */
+    private void steerAlongSight(AbstractMchVehicle v, Entity c) {
+        Vec3 eye = v.firstPersonEye(c, 1.0F);
+        if (eye == null) {
+            eye = c.getEyePosition();
+        }
+        Vec3 look = Vec3.directionFromRotation(c.getXRot(), c.getYRot());
+        Vec3 pos = this.position();
+        double along = Math.max(0.0, pos.subtract(eye).dot(look));
+        double lead = Math.max(8.0, this.guideSpeed * 6.0);
+        steerTo(eye.add(look.scale(along + lead)), LOS_MAX_TURN);
     }
 
     /** Turn the flight toward {@code aim} by at most {@code maxTurn} radians this tick, at cruise speed. */
@@ -1147,6 +1299,9 @@ public class MchBullet extends Entity {
     /** CLIENT: emit the config-driven smoke/flame trail along this tick's flight segment (3 interpolated puffs, like
      *  the reference), white smoke sized from the config — only when the weapon type trails. */
     private void emitTrail(Vec3 from, Vec3 to) {
+        if (TV_CAMERA_VIEW.test(this)) {
+            return; // reference isSpawnParticle = !isMissileCameraMode: no smoke in front of the nose camera
+        }
         int kind = this.entityData.get(DATA_TRAIL_KIND);
         if (kind == 0 || this.age < this.entityData.get(DATA_TRAIL_START)) {
             return; // config TrajectoryParticleStartTick delays the trail

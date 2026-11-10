@@ -165,6 +165,12 @@ public abstract class AbstractMchVehicle extends Entity implements MchControllab
      *  ({@code [HE]}, {@code [TA]}, …). */
     private static final EntityDataAccessor<CompoundTag> DATA_WEAPON_MODES =
         SynchedEntityData.defineId(AbstractMchVehicle.class, EntityDataSerializers.COMPOUND_TAG);
+    /** The vehicle's ACTIVE TV-guided missile (entity id, -1 none) — reference {@code TVmissile}; only it is steered. */
+    private static final EntityDataAccessor<Integer> DATA_TV_MISSILE =
+        SynchedEntityData.defineId(AbstractMchVehicle.class, EntityDataSerializers.INT);
+    /** The player (entity id) who fired / steers the active TV missile — the one whose view jumps to its camera. */
+    private static final EntityDataAccessor<Integer> DATA_TV_SHOOTER =
+        SynchedEntityData.defineId(AbstractMchVehicle.class, EntityDataSerializers.INT);
     /** Cached resolved config, invalidated whenever {@link #DATA_CONFIG} changes (server set or client sync). */
     private MCH_AircraftInfo resolvedInfo;
 
@@ -757,6 +763,8 @@ public abstract class AbstractMchVehicle extends Entity implements MchControllab
         builder.define(DATA_DESTROYED, false);
         builder.define(DATA_CONFIG, "");
         builder.define(DATA_WEAPON_MODES, new CompoundTag());
+        builder.define(DATA_TV_MISSILE, -1);
+        builder.define(DATA_TV_SHOOTER, -1);
     }
 
     /** The config name identifying this specific vehicle (synced), or "" before it is assigned at spawn. */
@@ -1586,6 +1594,9 @@ public abstract class AbstractMchVehicle extends Entity implements MchControllab
 
         // Flares/countermeasures: advance the dispense window, eject volleys, and decoy any missiles homing on us.
         tickFlares();
+
+        // Drop a TV missile that has gone.
+        validateTvMissile();
     }
 
     // ---- flares / countermeasures (#26) — server-authoritative dispenser + missile decoy ----
@@ -1849,6 +1860,73 @@ public abstract class AbstractMchVehicle extends Entity implements MchControllab
             return; // entering is gated; leaving is always allowed
         }
         this.entityData.set(DATA_GUNNER_MODE, !now);
+    }
+
+    // ---- TV-GUIDED MISSILE (reference MCH_EntityAircraft.TVmissile / isMissileCameraMode) ----
+
+    /** Entity id of the active TV missile, or -1. */
+    public int getTvMissileId() { return this.entityData.get(DATA_TV_MISSILE); }
+
+    /** Entity id of the player steering the active TV missile, or -1. */
+    public int getTvMissileShooterId() { return this.entityData.get(DATA_TV_SHOOTER); }
+
+    /** SERVER: make {@code missile} the active TV missile (the newest one takes over the steering). */
+    private void setTvMissile(Entity missile, Entity shooter) {
+        this.entityData.set(DATA_TV_MISSILE, missile != null ? missile.getId() : -1);
+        this.entityData.set(DATA_TV_SHOOTER, missile != null && shooter != null ? shooter.getId() : -1);
+    }
+
+    /** SERVER: drop the video link to {@code missile} if it is this vehicle's active TV missile (out of range) — the
+     *  operator's camera returns to the gun sight, the missile flies on unguided. */
+    public void releaseTvMissile(MchBullet missile) {
+        if (missile != null && getTvMissileId() == missile.getId()) {
+            setTvMissile(null, null);
+        }
+    }
+
+    /**
+     * SERVER, every tick: drop the TV link when the missile is gone (exploded / despawned), when it has flown out of
+     * the simulation distance (it stops ticking there and would hang frozen in the air with the operator's camera
+     * inside), or when the operator died, logged out or left the vehicle (his camera must not stay in the missile, or
+     * jump back into it after a respawn — the respawned player keeps his entity id).
+     */
+    private void validateTvMissile() {
+        int id = getTvMissileId();
+        if (id < 0) {
+            return;
+        }
+        Entity e = this.level().getEntity(id);
+        int sid = getTvMissileShooterId();
+        Entity op = null; // the operator, if he still rides this vehicle
+        for (Entity p : getPassengers()) {
+            if (p.getId() == sid) {
+                op = p;
+                break;
+            }
+        }
+        boolean frozen = e instanceof MchBullet b && !b.tickedRecently(this.level().getGameTime());
+        if (e == null || !e.isAlive() || frozen || op == null || !op.isAlive()) {
+            setTvMissile(null, null);
+        }
+    }
+
+    /**
+     * The TV missile {@code viewer} is flying through its nose camera right now, or null — reference
+     * {@code isMissileCameraMode}: an active TV missile, fired by this viewer, while the viewer is in camera view
+     * (gunner mode / a gunner seat, or a UAV).
+     */
+    public MchBullet tvMissileViewedBy(Entity viewer) {
+        int id = getTvMissileId();
+        if (id < 0 || viewer == null || getTvMissileShooterId() != viewer.getId() || isDestroyed()) {
+            return null;
+        }
+        MCH_AircraftInfo info = weaponHostInfo();
+        boolean cameraView = isSeatGunnerMode(seatIndexOf(viewer)) || (info != null && info.isUAV);
+        if (!cameraView) {
+            return null;
+        }
+        Entity e = this.level().getEntity(id);
+        return e instanceof MchBullet b && b.isAlive() ? b : null;
     }
 
     /** Who is sitting in {@code seat}, or null. */
@@ -2697,6 +2775,16 @@ public abstract class AbstractMchVehicle extends Entity implements MchControllab
                 MchBullet.callAirstrike(sl, tgt.x, tgt.y, tgt.z, this, Math.max(wi.explosion, 3), wi.power,
                     6 + this.random.nextInt(3));
             }
+        } else if (preType.equals("tvmissile") && fireMode == 0 && shooter instanceof Player) {
+            // Reference MCH_WeaponTvMissile mode 0 ([TV]): the missile follows the shooter's look every tick, and the
+            // shooter's view jumps to its nose camera while he is in gunner mode. The newest one takes the steering.
+            MchBullet tv = MchBullet.spawnTv(this.level(), muzzle, dir, speed, gravity, wi.power, 600, this, model,
+                color, wi, shooter);
+            setTvMissile(tv, shooter);
+        } else if (preType.equals("tvmissile") && shooter instanceof Player) {
+            // The NORMAL (non-[TV]) mode: no nose camera, but line-of-sight guided — it flies where the operator looks
+            // (the reference flew it straight; 1.5x speed as in the reference).
+            MchBullet.spawnLos(this.level(), muzzle, dir, speed, gravity, wi.power, 600, this, model, color, wi, shooter);
         } else {
             MchBullet round = MchBullet.spawnWeapon(this.level(), muzzle, dir, speed, accFactor, gravity, wi.power, 600,
                 this, model, color, wi);

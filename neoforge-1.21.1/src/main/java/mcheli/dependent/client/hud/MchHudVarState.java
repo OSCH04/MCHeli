@@ -158,7 +158,8 @@ public final class MchHudVarState implements HudState {
             case "MOTION_Y": return this.motion.y;
             case "MOTION_Z": return this.motion.z;
             case "THROTTLE": return this.vehicle.getThrottleInput() * 100.0;  // sim throttle, 0 at rest (not idle power)
-            case "CAM_ZOOM": return (double) mcheli.dependent.client.MchGunnerView.currentZoom(); // %.1f -> Double
+            case "CAM_ZOOM": return mcheli.dependent.client.MchTvView.activeMissile() != null ? 1.0 // TV camera: no zoom
+                : (double) mcheli.dependent.client.MchGunnerView.currentZoom(); // %.1f -> Double
             case "MC_THOR": return this.mcHour;
             case "MC_TMIN": return this.mcMin;
             case "MC_TSEC": return this.mcSec;
@@ -179,8 +180,28 @@ public final class MchHudVarState implements HudState {
             case "HP_PER": return this.vehicle.getMaxHp() > 0  // Double 0..100 (%.0f) — NOT the 0..1 fraction
                 ? (double) this.vehicle.getHp() / this.vehicle.getMaxHp() * 100.0 : 0.0;
             case "KEY_GUI": return "G";
+            // TV-missile HUD (reference MCH_HudItem.updateTvMissile): the missile's position + its distance from the
+            // launching aircraft; 0 while no TV missile flies.
+            case "TVM_POS_X": return tvMissile() != null ? tvMissile().getX() : 0.0;
+            case "TVM_POS_Y": return tvMissile() != null ? tvMissile().getY() : 0.0;
+            case "TVM_POS_Z": return tvMissile() != null ? tvMissile().getZ() : 0.0;
+            case "TVM_DIFF": return tvMissile() != null ? (double) tvMissile().distanceTo(this.vehicle) : 0.0;
             default: return "";
         }
+    }
+
+    private net.minecraft.world.entity.Entity tvMissileCache;
+    private boolean tvResolved;
+
+    /** The vehicle's active TV missile as the client sees it, or null. */
+    private net.minecraft.world.entity.Entity tvMissile() {
+        if (!this.tvResolved) {
+            this.tvResolved = true;
+            int id = this.vehicle.getTvMissileId();
+            net.minecraft.world.entity.Entity e = id >= 0 ? this.vehicle.level().getEntity(id) : null;
+            this.tvMissileCache = e != null && e.isAlive() ? e : null;
+        }
+        return this.tvMissileCache;
     }
 
     private static double rot360(double v) {
